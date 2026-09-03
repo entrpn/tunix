@@ -15,6 +15,7 @@
 """Algorithm core implementations for RL and Agentic RL learners."""
 
 import functools
+
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -200,7 +201,6 @@ def ppo_policy_loss_fn(
   else:
     per_token_logps = outputs
 
-
   advantages = train_example.advantages
   old_per_token_logps = train_example.old_per_token_logps
 
@@ -246,7 +246,9 @@ def ppo_policy_loss_fn(
   }
 
   if return_entropy:
-    unreduced_entropy = jnp.sum(token_entropy * completion_mask)  # pyrefly: ignore[unbound-name]
+    unreduced_entropy = jnp.sum(
+        token_entropy * completion_mask
+    )  # pyrefly: ignore[unbound-name]
     unreduced_policy_loss = (
         unreduced_policy_loss - entropy_coef * unreduced_entropy
     )
@@ -458,10 +460,14 @@ def grpo_loss_fn(
       # scatter each token its own segment's mean via take_along_axis. Padding
       # (segment 0, mask 0) yields 0 and is masked out downstream.
       per_seg_sum = common.segmented_sum(
-          seq_importance_ratio * completion_mask, segment_ids, num_segments  # pyrefly: ignore[bad-argument-type]
+          seq_importance_ratio * completion_mask,
+          segment_ids,
+          num_segments,  # pyrefly: ignore[bad-argument-type]
       )
       per_seg_count = common.segmented_count(
-          segment_ids, num_segments, mask=completion_mask  # pyrefly: ignore[bad-argument-type]
+          segment_ids,
+          num_segments,
+          mask=completion_mask,  # pyrefly: ignore[bad-argument-type]
       )
       per_seg_mean = per_seg_sum / jnp.clip(per_seg_count, min=1.0)
       seq_mean_ratio = jnp.take_along_axis(
@@ -541,13 +547,13 @@ def grpo_loss_fn(
       segment_ids=segment_ids,
       num_segments=num_segments,
   )
-  total_loss = unreduced_pg_loss  # KL added below when beta != 0; feeds gradient
+  total_loss = (
+      unreduced_pg_loss  # KL added below when beta != 0; feeds gradient
+  )
   # Per-token diagnostics — log only over assistant tokens (completion_mask).
   is_ratio_mean = masked_mean(is_ratio, completion_mask)
   is_ratio_max = jnp.max(jnp.where(completion_mask > 0, is_ratio, 0.0))
-  is_ratio_min = jnp.min(
-      jnp.where(completion_mask > 0, is_ratio, jnp.inf)
-  )
+  is_ratio_min = jnp.min(jnp.where(completion_mask > 0, is_ratio, jnp.inf))
   log_ratio_abs_mean = masked_mean(
       jnp.abs(seq_importance_ratio), completion_mask
   )
@@ -585,6 +591,103 @@ def grpo_loss_fn(
       "advantage/min": adv_min,
       "advantage/nonzero_frac": nonzero_adv_frac,
   }
+  # ---- Sampler-vs-trainer importance-sampling diagnostics -------------------
+  # Computed whenever the rollout engine reported log-probabilities. Nothing
+  # here affects the loss; these quantify how far the behaviour policy (the
+  # rollout engine) has drifted from the target policy (the trainer), which is
+  # what an importance-sampling correction would have to correct for.
+  rollout_logps = getattr(train_example, "rollout_per_token_logps", None)
+  if rollout_logps is not None:
+    log_is = jnp.nan_to_num(
+        jax.lax.stop_gradient(per_token_logps)
+        - jnp.astype(rollout_logps, jnp.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    is_w = jnp.nan_to_num(jnp.exp(log_is), nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Per-sequence geometric mean of the token weights. Under packing a row
+    # holds several sequences, so pool per segment rather than per row.
+    if segment_ids is None:
+      seq_log_mean = (log_is * completion_mask).sum(axis=-1) / (
+          completion_mask.sum(axis=-1) + 1e-8
+      )
+      seq_valid = (completion_mask.sum(axis=-1) > 0).astype(jnp.float32)
+    else:
+      seg_sum = common.segmented_sum(
+          log_is * completion_mask, segment_ids, num_segments
+      )
+      seg_cnt = common.segmented_count(
+          segment_ids, num_segments, mask=completion_mask
+      )
+      seq_log_mean = seg_sum / (seg_cnt + 1e-8)
+      seq_valid = (seg_cnt > 0).astype(jnp.float32)
+    seq_geo = jnp.exp(seq_log_mean)
+
+    n_seq = jnp.maximum(seq_valid.sum(), 1.0)
+    aux["sampler_is/token_logdiff_absmean"] = masked_mean(
+        jnp.abs(log_is), completion_mask
+    )
+    aux["sampler_is/token_weight_mean"] = masked_mean(is_w, completion_mask)
+    aux["sampler_is/token_weight_max"] = jnp.max(
+        jnp.where(completion_mask > 0, is_w, 0.0)
+    )
+    aux["sampler_is/seq_geomean_mean"] = (seq_geo * seq_valid).sum() / n_seq
+    _has_seq = seq_valid.sum() > 0
+    aux["sampler_is/seq_geomean_min"] = jnp.where(
+        _has_seq, jnp.min(jnp.where(seq_valid > 0, seq_geo, jnp.inf)), 1.0
+    )
+    aux["sampler_is/seq_geomean_max"] = jnp.where(
+        _has_seq, jnp.max(jnp.where(seq_valid > 0, seq_geo, -jnp.inf)), 1.0
+    )
+
+    # Would-be drop rate for a sequence-level filter at the configured band
+    # (or the reference band when unset). Reported only; no sequence is
+    # actually dropped here.
+    lo = getattr(algo_config, "truncated_importance_sampling_ratio_min", None)
+    hi = getattr(algo_config, "truncated_importance_sampling_ratio", None)
+    for name, (a, b) in {
+        "tight": (0.999, 1.002),
+        "pct1": (0.99, 1.01),
+        "pct5": (0.95, 1.05),
+    }.items():
+      kept = ((seq_geo >= a) & (seq_geo <= b)).astype(jnp.float32) * seq_valid
+      aux[f"sampler_is/would_drop_{name}"] = 1.0 - kept.sum() / n_seq
+    if lo is not None and hi is not None:
+      kept = ((seq_geo >= lo) & (seq_geo <= hi)).astype(jnp.float32) * seq_valid
+      aux["sampler_is/is_oob_ratio"] = 1.0 - kept.sum() / n_seq
+    # ---- Truncation-vs-drop split (Step 3 decisive diagnostic) --------------
+    # Tests whether the sequences a tight [0.999, 1.002] seq-geomean filter
+    # would drop are the SAME sequences the rollout engine truncated (overlong).
+    #   _complete ~ 0, _truncated ~ 1  -> same population; overlong filtering
+    #                                     removes the drops.
+    #   both ~ would_drop_tight        -> independent; the per-sequence offset
+    #                                     is the real problem, not truncation.
+    # Per-sequence (not per-token), so no packed-scatter path exists yet; guard
+    # on segment_ids is None and revisit when packing + overlong land together.
+    # TODO(jfacevedo): packed support for `overlong` (per-segment scatter).
+    overlong = getattr(train_example, "overlong", None)
+    if overlong is not None and segment_ids is None:
+      _ok = ((seq_geo >= 0.999) & (seq_geo <= 1.002)).astype(jnp.float32)
+      _ol = jnp.astype(overlong, jnp.float32)
+      _trunc = _ol * seq_valid
+      _full = (1.0 - _ol) * seq_valid
+      # Drop rate within each subpopulation (1 - keep_rate). maximum(., 1)
+      # guards the empty-subpopulation case (e.g. no truncated seqs in batch),
+      # which then reports drop_rate = 1 - 0 = 1.0 vacuously; read alongside
+      # overlong_frac to know whether the denominator was non-empty.
+      aux["sampler_is/would_drop_tight_truncated"] = 1.0 - (
+          _ok * _trunc
+      ).sum() / jnp.maximum(_trunc.sum(), 1.0)
+      aux["sampler_is/would_drop_tight_complete"] = 1.0 - (
+          _ok * _full
+      ).sum() / jnp.maximum(_full.sum(), 1.0)
+      # Free cross-check: overlong fraction from engine status vs clip_ratio
+      # from the token-length predicate (generation/.../clip_ratio). Both were
+      # ~0.75 expected; divergence means one predicate is wrong (B1 territory).
+      aux["sampler_is/overlong_frac"] = _trunc.sum() / n_seq
+
   if sampler_is_weights is not None:
     sis = sampler_is_weights.astype(jnp.float32)
     aux["sampler_is/weight_mean"] = masked_mean(sis, completion_mask)
@@ -617,7 +720,8 @@ def grpo_loss_fn(
     aux["kl_loss"] = kl_loss  # pyrefly: ignore[bad-assignment]
   if beta is not None and beta != 0.0:
     total_loss = sft_utils.WeightedMetric(
-        unreduced_pg_loss.unreduced_sum + beta * kl_loss.unreduced_sum,  # pyrefly: ignore[unbound-name]
+        unreduced_pg_loss.unreduced_sum
+        + beta * kl_loss.unreduced_sum,  # pyrefly: ignore[unbound-name]
         unreduced_pg_loss.denominator,
         eps=unreduced_pg_loss.eps,
         min_denom=unreduced_pg_loss.min_denom,
@@ -632,7 +736,9 @@ def grpo_loss_fn(
   )
   aux["entropy"] = entropy_loss
 
-  return sft_utils.LossOutput(primary_loss=total_loss, aux_metrics=aux)  # pyrefly: ignore[bad-argument-type]
+  return sft_utils.LossOutput(
+      primary_loss=total_loss, aux_metrics=aux
+  )  # pyrefly: ignore[bad-argument-type]
 
 
 @function_registry.register_advantage_estimator("grpo")

@@ -435,6 +435,41 @@ class UtilsTest(absltest.TestCase):
       )
       self.assertTrue(bool(np.asarray(pack2.is_update_step)[0]))
 
+  def test_pack_sequences_carries_rollout_logps(self):
+    """rollout_per_token_logps must be repacked alongside old_per_token_logps.
+
+    The IS correction in the loss compares it against per-token logps computed
+    on the packed row, so a layout mismatch here would silently compare
+    misaligned positions.
+    """
+    example = self._create_mock_train_example(
+        2,
+        3,
+        old_per_token_logps=jnp.full((1, 3), -0.5, dtype=jnp.float32),
+        rollout_per_token_logps=jnp.full((1, 3), -0.7, dtype=jnp.float32),
+    )
+    packed = list(
+        utils.pack_sequences(
+            iter([[example]]),
+            max_token_budget=10,
+            pad_id=0,
+            sequences_per_update=1,
+        )
+    )[0][0]
+
+    self.assertIsNotNone(packed.rollout_per_token_logps)
+    self.assertEqual(
+        packed.rollout_per_token_logps.shape, packed.completion_mask.shape
+    )
+    # 2 prompt + 3 completion tokens -> completion sits at positions 2..4,
+    # matching the [0, 0, 1, 1, 1, ...] completion_mask in test_pack_sequences.
+    np.testing.assert_allclose(
+        np.asarray(packed.rollout_per_token_logps)[0, 2:5], -0.7
+    )
+    np.testing.assert_allclose(
+        np.asarray(packed.old_per_token_logps)[0, 2:5], -0.5
+    )
+
   def test_pack_sequences_sets_num_segments_to_budget_plus_one(self):
     # num_segments is the static (pytree_node=False) segment-bucket upper bound.
     # It must equal budget + 1 (a pack of `budget` tokens holds at most `budget`

@@ -29,6 +29,7 @@ The data flow is designed around an asynchronous producer-consumer pattern:
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 from typing import Any, Dict, List, Sequence, Type, TypeVar
 
@@ -316,6 +317,21 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         "advantage/nonzero_frac": common.mean_of_means,
         "sampler_is/weight_mean": common.mean_of_means,
         "sampler_is/weight_min": np.min,
+        "sampler_is/token_logdiff_absmean": common.mean_of_means,
+        "sampler_is/token_weight_mean": common.mean_of_means,
+        "sampler_is/token_weight_max": np.max,
+        "sampler_is/seq_geomean_mean": common.mean_of_means,
+        "sampler_is/seq_geomean_min": np.min,
+        "sampler_is/seq_geomean_max": np.max,
+        "sampler_is/would_drop_tight": common.mean_of_means,
+        "sampler_is/would_drop_pct1": common.mean_of_means,
+        "sampler_is/would_drop_pct5": common.mean_of_means,
+        "sampler_is/would_drop_tight": common.mean_of_means,
+        "sampler_is/would_drop_pct1": common.mean_of_means,
+        "sampler_is/would_drop_pct5": common.mean_of_means,
+        "sampler_is/would_drop_tight_truncated": common.mean_of_means,
+        "sampler_is/would_drop_tight_complete": common.mean_of_means,
+        "sampler_is/overlong_frac": common.mean_of_means,
     })
     self.rl_engine.actor_trainer.with_tqdm_metrics_to_display([  # pyrefly: ignore[bad-argument-type]
         lambda: "kl"
@@ -569,6 +585,10 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
     policy_versions_list: List[int] = []
     trajectory_rewards_list: List[float] = []
     raw_completion_lengths: List[int] = []
+    # Troubleshooting/diagnostic scaffolding (Step 3): per-sequence truncation
+    # flag, fed to TrainExample.overlong for the loss-side would_drop split.
+    # Remove with the overlong diagnostic if it doesn't earn its keep.
+    overlong_flags: List[float] = []
     trajectories_to_log = []
 
     for item in trajectories:
@@ -582,7 +602,6 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
           ),
           "",
       )
-
       completion_texts.append(assistant_text)
       prompt_tokens_list.append(item.traj.get("prompt_tokens"))
       completion_tokens_list.append(item.traj.get("conversation_tokens"))
@@ -593,6 +612,21 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         raise ValueError("policy_version is missing from trajectory task.")
       policy_versions_list.append(policy_version)
       trajectory_rewards_list.append(item.traj.get("trajectory_reward"))
+      # The collect engine's own verdict. "overlong" here means the response
+      # budget was exhausted without an EOS, i.e. the sample is a truncated
+      # prefix. Note this is narrower than the engine's `filter_statuses`,
+      # which also covers agent/env failures. Appended last so it doesn't split
+      # the append block above.
+      overlong_flags.append(
+          1.0 if item.traj.get("status") == "MAX_CONTEXT_LIMIT_REACHED" else 0.0
+      )
+
+    # Diagnostic (Step 3): status histogram for the batch. One line per group,
+    # after the loop so `item` is not shadowed and the count is done once.
+    _statuses = collections.Counter(
+        item.traj.get("status") for item in trajectories
+    )
+    logging.info("trajectory statuses: %s", dict(_statuses))
 
     # Log trajectory.
     if self._trajectory_logger and trajectories_to_log:
@@ -943,6 +977,8 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         ref_per_token_logps=ref_per_token_logps,
         advantages=advantages,
         old_per_token_logps=old_per_token_logps,
+        rollout_per_token_logps=rollout_per_token_logps,
+        overlong=jnp.asarray(overlong_flags, dtype=jnp.float32),
         policy_version=policy_versions,
         sampler_is_weights=sampler_is_weights,
     )

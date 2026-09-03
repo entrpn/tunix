@@ -79,8 +79,12 @@ class RepeatIterable(Iterable[Any]):
 
     # Slice the rollout batch into mini-batches.
     for i in range(num_mini_batches):
-      start = i * self._mini_batch_size  # pyrefly: ignore[unsupported-operation]
-      end = start + self._mini_batch_size  # pyrefly: ignore[unsupported-operation]
+      start = (
+          i * self._mini_batch_size
+      )  # pyrefly: ignore[unsupported-operation]
+      end = (
+          start + self._mini_batch_size
+      )  # pyrefly: ignore[unsupported-operation]
       batch_indices = shuffled_indices[start:end]
 
       mini_batch = jtu.tree_map(
@@ -123,6 +127,20 @@ class TrainExample:
   # to dampen positions where the trainer's recomputed log-probability
   # diverges from the rollout sampler's. ``None`` disables the correction.
   sampler_is_weights: ArrayType | None = None
+  # Per-token log-probabilities reported by the rollout engine for the tokens
+  # it generated (the *behaviour* policy). Distinct from
+  # ``old_per_token_logps``, which is whatever policy the surrogate ratio is
+  # taken against -- the two coincide in the common case, but diverge when the
+  # ratio is taken against a trainer recompute or pinned to 1.0. Kept separate
+  # so an importance-sampling correction can always reference the policy that
+  # actually produced the samples. ``None`` when the rollout engine does not
+  # return log-probabilities.
+  rollout_per_token_logps: ArrayType | None = None
+  # Per-sequence flag: 1.0 where the rollout engine reported
+  # MAX_CONTEXT_LIMIT_REACHED, i.e. the response budget was exhausted without
+  # an EOS and the sample is a truncated prefix rather than a complete
+  # trajectory.
+  overlong: ArrayType | None = None
 
   def to_jax_array(self) -> "TrainExample":
     """Returns a copy of the batch with all array fields moved to JAX array."""
@@ -446,13 +464,17 @@ def compute_per_token_logps(
       )
       if return_entropy:
         per_token_entropy = jnp.pad(
-            per_token_entropy, ((0, 0), (1, 0)), constant_values=0.0  # pyrefly: ignore[unbound-name]
+            per_token_entropy,
+            ((0, 0), (1, 0)),
+            constant_values=0.0,  # pyrefly: ignore[unbound-name]
         )
 
     if stop_gradient:
       per_token_logps = jax.lax.stop_gradient(per_token_logps)
       if return_entropy:
-        per_token_entropy = jax.lax.stop_gradient(per_token_entropy)  # pyrefly: ignore[unbound-name]
+        per_token_entropy = jax.lax.stop_gradient(
+            per_token_entropy
+        )  # pyrefly: ignore[unbound-name]
 
     if return_entropy:
       return per_token_logps, per_token_entropy  # pyrefly: ignore[unbound-name]

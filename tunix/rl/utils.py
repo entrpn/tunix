@@ -35,6 +35,7 @@ NamedSharding = jax.sharding.NamedSharding
 _OPTIONAL_PER_TOKEN_KEYS = (
     "ref_per_token_logps",
     "old_per_token_logps",
+    "rollout_per_token_logps",
     "returns",
     "old_values",
 )
@@ -248,13 +249,17 @@ def put_params_on_memory_kind(
   logging.debug("params_on_memory_kind shardings: %s", shardings)
   return params_on_memory_kind
 
+
 def create_critic_model(
-    actor_model: nnx.Module, seed: int = 0, rngs: nnx.Rngs = None, lm_head_to_replace: str = "lm_head"  # pyrefly: ignore[bad-function-definition]
+    actor_model: nnx.Module,
+    seed: int = 0,
+    rngs: nnx.Rngs = None,
+    lm_head_to_replace: str = "lm_head",  # pyrefly: ignore[bad-function-definition]
 ) -> nnx.Module:
   """Creates a critic model from an actor model."""
 
   if rngs is None:
-    rngs=nnx.Rngs(seed)
+    rngs = nnx.Rngs(seed)
 
   g, state = nnx.split(actor_model)
   # TODO(tsbao): if actor model is a LoRA model, then we can potentially share
@@ -266,25 +271,24 @@ def create_critic_model(
       lm_head.shape[0] if hasattr(lm_head, "shape") else lm_head.in_features
   )
   new_head = nnx.Linear(
-          in_features=hidden_dim,
-          out_features=1,
-          use_bias=False,
-          rngs=rngs,
-      )
+      in_features=hidden_dim,
+      out_features=1,
+      use_bias=False,
+      rngs=rngs,
+  )
 
   # If Qwix is active for the model, also assign qwix_path for the new head
   if hasattr(critic_model, "qwix_path"):
-    new_head.qwix_path = getattr(lm_head, "qwix_path", (lm_head_to_replace,))  # pyrefly: ignore[missing-attribute]
-  setattr(
-      critic_model,
-      lm_head_to_replace,
-      new_head
-  )
+    new_head.qwix_path = getattr(
+        lm_head, "qwix_path", (lm_head_to_replace,)
+    )  # pyrefly: ignore[missing-attribute]
+  setattr(critic_model, lm_head_to_replace, new_head)
 
   return critic_model
 
 
 class TransformerWithScoreHead(nnx.Module):
+
   def __init__(self, transformer: nnx.Module, rngs: nnx.Rngs):
     """Initializes the transformer with a score head.
 
@@ -292,10 +296,14 @@ class TransformerWithScoreHead(nnx.Module):
       transformer: The transformer backbone.
       rngs: The random number generator.
     """
-    if hasattr(transformer, 'embed_dim'):
+    if hasattr(transformer, "embed_dim"):
       embed_dim = transformer.embed_dim
-    elif hasattr(transformer.config, 'embed_dim'):  # pyrefly: ignore[missing-attribute]
-      embed_dim = transformer.config.embed_dim  # pyrefly: ignore[missing-attribute]
+    elif hasattr(
+        transformer.config, "embed_dim"
+    ):  # pyrefly: ignore[missing-attribute]
+      embed_dim = (
+          transformer.config.embed_dim
+      )  # pyrefly: ignore[missing-attribute]
     else:
       raise ValueError("Could not determine embed dim for the transformer.")
 
@@ -314,7 +322,7 @@ class TransformerWithScoreHead(nnx.Module):
   def __call__(self, *args, **kwargs):
     self.transformer(*args, **kwargs, output_hidden_states=True)
     hidden_states = nnx.pop(self.transformer, nnx.Intermediate)[
-        'all_hidden_states'
+        "all_hidden_states"
     ].value[-1]
     score = self.score(hidden_states)
     return score
@@ -349,6 +357,9 @@ def unpad_train_example(example: common.TrainExample) -> list[dict[str, Any]]:
   has_old = example.old_per_token_logps is not None
   if has_old:
     old_logps = np.asarray(example.old_per_token_logps)
+  has_rollout = example.rollout_per_token_logps is not None
+  if has_rollout:
+    rollout_logps = np.asarray(example.rollout_per_token_logps)
 
   returns_val = getattr(example, "returns", None)
   has_returns = returns_val is not None
@@ -379,12 +390,27 @@ def unpad_train_example(example: common.TrainExample) -> list[dict[str, Any]]:
         "completion_mask": c_mask[i, :c_len],
         "advantages": adv[i, :c_len] if adv_is_per_token else adv[i],
         "adv_is_per_token": adv_is_per_token,
-        "ref_per_token_logps": ref_logps[i, :c_len] if has_ref else None,  # pyrefly: ignore[unbound-name]
-        "old_per_token_logps": old_logps[i, :c_len] if has_old else None,  # pyrefly: ignore[unbound-name]
-        "returns": returns_np[i, :c_len] if has_returns else None,  # pyrefly: ignore[unbound-name]
-        "old_values": old_values_np[i, :c_len] if has_old_values else None,  # pyrefly: ignore[unbound-name]
+        "ref_per_token_logps": (
+            ref_logps[i, :c_len] if has_ref else None
+        ),  # pyrefly: ignore[unbound-name]
+        "old_per_token_logps": (
+            old_logps[i, :c_len] if has_old else None
+        ),  # pyrefly: ignore[unbound-name]
+        "rollout_per_token_logps": (
+            rollout_logps[i, :c_len]
+            if has_rollout
+            else None  # pyrefly: ignore[unbound-name]
+        ),
+        "returns": (
+            returns_np[i, :c_len] if has_returns else None
+        ),  # pyrefly: ignore[unbound-name]
+        "old_values": (
+            old_values_np[i, :c_len] if has_old_values else None
+        ),  # pyrefly: ignore[unbound-name]
         "policy_version": (
-            policy_version_np[i : i + 1] if has_policy_version else None  # pyrefly: ignore[unbound-name]
+            policy_version_np[i : i + 1]
+            if has_policy_version
+            else None  # pyrefly: ignore[unbound-name]
         ),
     }
     res.append(item)
@@ -530,6 +556,8 @@ def pack_sequences(
       tracked_per_token_keys.append("ref_per_token_logps")
     if first_item.get("old_per_token_logps") is not None:
       tracked_per_token_keys.append("old_per_token_logps")
+    if first_item.get("rollout_per_token_logps") is not None:
+      tracked_per_token_keys.append("rollout_per_token_logps")
     if first_item.get("returns") is not None:
       tracked_per_token_keys.append("returns")
     if first_item.get("old_values") is not None:
@@ -552,6 +580,7 @@ def pack_sequences(
           advantages=adv_arr,
           ref_per_token_logps=None,
           old_per_token_logps=None,
+          rollout_per_token_logps=None,
           segment_ids=seg_arr,
           segment_positions=pos_arr,
       )
@@ -640,6 +669,7 @@ def pack_sequences(
         advantages=adv_arr,
         ref_per_token_logps=None,
         old_per_token_logps=None,
+        rollout_per_token_logps=None,
         segment_ids=seg_arr,
         segment_positions=pos_arr,
     )
@@ -672,7 +702,9 @@ def pack_sequences(
     # once. Set here (not per bin) so every emitted chunk carries it.
     kwargs = dict(is_update_step=jnp.array([is_update], dtype=jnp.bool_))
     if hasattr(merged, "num_segments"):
-      kwargs["num_segments"] = effective_max_segments + 1  # pyrefly: ignore[bad-assignment]
+      kwargs["num_segments"] = (
+          effective_max_segments + 1
+      )  # pyrefly: ignore[bad-assignment]
     return [merged.replace(**kwargs)]
 
   # See the docstring: buffer sequences, emit a chunk once it holds a chunk's
