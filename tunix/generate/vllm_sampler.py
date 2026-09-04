@@ -19,7 +19,7 @@ import dataclasses
 import gc
 from itertools import count
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, cast, Dict, List, Optional, Tuple, Union
 
 from absl import logging
 from flax import nnx
@@ -191,7 +191,7 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
 
     if self.llm is not None:
       self.llm.reset_prefix_cache()
-      self.llm.collective_rpc("delete_kv_cache") # will free hbm
+      self.llm.collective_rpc("delete_kv_cache")  # will free hbm
     elif self._driver is not None:
       self._driver.llm_engine.reset_prefix_cache()
       self._driver.llm_engine.collective_rpc("delete_kv_cache")
@@ -430,10 +430,13 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
             np.array(single_output.token_ids, dtype=np.int32)
         )
         decoded_outputs[idx].append(
-            self.tokenizer.decode(single_output.token_ids)  # pyrefly: ignore[bad-argument-type]
+            self.tokenizer.decode(
+                single_output.token_ids
+            )  # pyrefly: ignore[bad-argument-type]
         )
         logprobs = utils.get_logprobs_from_vllm_output(
-            list(single_output.token_ids), single_output.logprobs  # pyrefly: ignore[bad-argument-type]
+            list(single_output.token_ids),
+            single_output.logprobs,  # pyrefly: ignore[bad-argument-type]
         )
         out_logprobs[idx].append(logprobs)
         logging.debug(
@@ -523,7 +526,9 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
         else:
           sampling_params = SamplingParams()
       else:
-        sampling_params = self.llm.get_default_sampling_params()  # pyrefly: ignore[missing-attribute]
+        sampling_params = (
+            self.llm.get_default_sampling_params()
+        )  # pyrefly: ignore[missing-attribute]
       sampling_params.detokenize = False
       sampling_params.max_tokens = max_generation_steps
       sampling_params.n = multi_sampling
@@ -582,6 +587,17 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
         List[TokensPrompt],
         [{"prompt_token_ids": list(ids)} for ids in prompt_ids],
     )
+    logging.info(
+        "VLLM_SAMPLING_FINAL temperature=%s top_p=%s top_k=%s n=%s "
+        "logprobs=%s (top_p_arg=%s top_k_arg=%s)",
+        sampling_params.temperature,
+        getattr(sampling_params, "top_p", "UNSET"),
+        getattr(sampling_params, "top_k", "UNSET"),
+        sampling_params.n,
+        sampling_params.logprobs,
+        top_p,  # what arrived as the argument
+        top_k,  # what arrived as the argument
+    )
     if self._driver is not None:
       outputs = self._generate_server_mode(prompt_objects, sampling_params)
     else:
@@ -619,5 +635,7 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
         logits=None,
         tokens=out_tokens[0],
         padded_prompt_tokens=all_input_ids,
-        logprobs=out_logprobs[0] if self.config.return_logprobs else None,  # pyrefly: ignore[bad-argument-type]
+        logprobs=out_logprobs[0]
+        if self.config.return_logprobs
+        else None,  # pyrefly: ignore[bad-argument-type]
     )
