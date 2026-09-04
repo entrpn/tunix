@@ -14,6 +14,7 @@
 
 """Algorithm core implementations for RL and Agentic RL learners."""
 
+from collections.abc import Sequence
 import functools
 
 from flax import nnx
@@ -157,6 +158,160 @@ def masked_var(
   mask_sum = cast_mask.sum()
   bessel_corr = mask_sum / (mask_sum - 1)
   return variance * bessel_corr
+
+
+def sampler_is_length_bucket_names(
+    bucket_edges: Sequence[int] | None,
+) -> list[str]:
+  """Metric-name suffixes for the sampler-IS length-scaling buckets.
+
+  `bucket_edges` are inclusive upper bounds on completion length, in tokens;
+  one trailing open-ended bucket is always appended. Shared by the loss (which
+  emits the metrics) and the learner (which registers their aggregators), so
+  the two cannot drift apart.
+
+  Args:
+    bucket_edges: Strictly increasing positive upper bounds, or None.
+
+  Returns:
+    One name per bucket, e.g. (256, 1024) -> ["le256", "le1024", "gt1024"].
+  """
+  if not bucket_edges:
+    return []
+  return [f"le{e}" for e in bucket_edges] + [f"gt{bucket_edges[-1]}"]
+
+
+# Metric suffixes emitted per (length bucket, completion status). Raw sums, so
+# that pooling across micro-batches and shards is exact -- and so that the two
+# statuses add back to the bucket total, losing nothing to the split. See
+# `sampler_is_length_bucket_sums`.
+SAMPLER_IS_LENGTH_BUCKET_METRICS = (
+    "count",
+    "len_sum",
+    "logmean_sum",
+    "logmean_sq_sum",
+    "iid_var_sum",
+)
+
+# Sequences are split by the rollout engine's truncation verdict. Truncated
+# sequences all pile up at the response-length cap, so without the split the
+# longest bucket is really "the truncated ones" and length scaling cannot be
+# read off it.
+SAMPLER_IS_COMPLETION_STATUSES = ("complete", "truncated")
+
+
+def sampler_is_length_bucket_metric_names(
+    bucket_edges: Sequence[int] | None,
+) -> list[str]:
+  """Every metric-name suffix the length-scaling diagnostic emits.
+
+  Args:
+    bucket_edges: Inclusive upper bounds on completion length, or None.
+
+  Returns:
+    Suffixes of the form `<bucket>/<status>/<metric>`, to be registered by the
+    learner and prefixed by the loss.
+  """
+  return [
+      f"{bucket}/{status}/{metric}"
+      for bucket in sampler_is_length_bucket_names(bucket_edges)
+      for status in SAMPLER_IS_COMPLETION_STATUSES
+      for metric in SAMPLER_IS_LENGTH_BUCKET_METRICS
+  ]
+
+
+def sampler_is_length_bucket_sums(
+    log_is: jax.Array,
+    seq_log_mean: jax.Array,
+    completion_mask: jax.Array,
+    seq_valid: jax.Array,
+    bucket_edges: Sequence[int],
+    overlong: jax.Array | None = None,
+) -> dict[str, jax.Array]:
+  """Length-bucketed sums for the sampler-vs-trainer offset scaling diagnostic.
+
+  Distinguishes the two candidate explanations for the per-sequence offset
+  between the rollout sampler's and the trainer's log-probabilities, which have
+  opposite consequences at production sequence lengths:
+
+    iid token noise
+      The per-sequence log-mean is an average of T independent terms, so its
+      spread falls as 1/sqrt(T). Longer sequences fix the offset on their own.
+    systematic within-sequence bias
+      Every token in a sequence leans the same way, nothing cancels, and the
+      spread is flat in T. Longer sequences do not help, and a fixed
+      importance-sampling keep-band stays unreachable at any scale.
+
+  Both are measurable inside a single batch, by bucketing the sequences already
+  present by their own length. Raw sums are returned rather than ratios so that
+  pooling across micro-batches and data-parallel shards is exact (a plain sum)
+  instead of an average of averages. Per bucket, offline:
+
+      observed_rms = sqrt(logmean_sq_sum / count)   # spread actually seen
+      iid_rms      = sqrt(iid_var_sum   / count)    # spread iid noise allows
+      excess       = observed_rms / iid_rms
+
+  `excess ~= 1` in every bucket means iid: the offset shrinks like 1/sqrt(T).
+  `excess` rising with bucket length means systematic: it does not shrink.
+
+  `iid_var_sum` is built from the *within-sequence* scatter of the per-token log
+  ratio about that sequence's own mean, which is the correct null model -- it is
+  what the per-sequence spread would be if those same tokens were independent.
+  Using it rather than a batch-wide noise estimate keeps the comparison valid
+  even when the per-token scatter itself varies with length.
+
+  Buckets are additionally split by the rollout engine's truncation verdict.
+  Truncated sequences all sit at the response-length cap, so pooling them with
+  the rest would put every long sequence in the same bucket as every truncated
+  one and confound length with truncation -- which is precisely the variable
+  already known to shift the offset. Read the `complete` series for the length
+  trend; the two series are raw sums, so they add back to the bucket total.
+
+  Args:
+    log_is: Per-token trainer-minus-sampler log ratio, `[B, T]`.
+    seq_log_mean: Its per-sequence masked mean, `[B]`.
+    completion_mask: Per-token mask over scored tokens, `[B, T]`.
+    seq_valid: 1.0 for rows holding a scored sequence, `[B]`.
+    bucket_edges: Inclusive upper bounds on completion length, in tokens,
+      strictly increasing; one open-ended bucket is appended.
+    overlong: 1.0 for sequences the rollout engine truncated, `[B]`. When None,
+      every sequence is reported as `complete` and the `truncated` series is
+      empty (`count = 0`), which is how a missing verdict announces itself.
+
+  Returns:
+    Metric name (`<bucket>/<status>/<metric>`) to scalar sum.
+  """
+  seq_len = completion_mask.sum(axis=-1)
+  seq_len_safe = jnp.maximum(seq_len, 1.0)
+  centered = (log_is - seq_log_mean[:, None]) * completion_mask
+  within_var = (centered**2).sum(axis=-1) / seq_len_safe
+
+  truncated = (
+      jnp.zeros_like(seq_valid)
+      if overlong is None
+      else jnp.astype(overlong, jnp.float32)
+  )
+  by_status = {"complete": 1.0 - truncated, "truncated": truncated}
+
+  sums = {}
+  lowers = (0,) + tuple(bucket_edges)
+  uppers = tuple(bucket_edges) + (None,)
+  for name, lower, upper in zip(
+      sampler_is_length_bucket_names(bucket_edges), lowers, uppers
+  ):
+    in_bucket = seq_len > lower
+    if upper is not None:
+      in_bucket = in_bucket & (seq_len <= upper)
+    in_bucket = in_bucket.astype(jnp.float32) * seq_valid
+    for status, status_mask in by_status.items():
+      m = in_bucket * status_mask
+      prefix = f"{name}/{status}"
+      sums[f"{prefix}/count"] = m.sum()
+      sums[f"{prefix}/len_sum"] = (m * seq_len).sum()
+      sums[f"{prefix}/logmean_sum"] = (m * seq_log_mean).sum()
+      sums[f"{prefix}/logmean_sq_sum"] = (m * seq_log_mean**2).sum()
+      sums[f"{prefix}/iid_var_sum"] = (m * within_var / seq_len_safe).sum()
+  return sums
 
 
 # ==============================================================================
@@ -687,6 +842,24 @@ def grpo_loss_fn(
       # from the token-length predicate (generation/.../clip_ratio). Both were
       # ~0.75 expected; divergence means one predicate is wrong (B1 territory).
       aux["sampler_is/overlong_frac"] = _trunc.sum() / n_seq
+
+    # ---- Length scaling of the per-sequence offset --------------------------
+    # Does the per-sequence offset shrink as sequences get longer (iid token
+    # noise, which scales away) or not (systematic within-sequence bias, which
+    # never will)? See `sampler_is_length_bucket_sums` for the statistic and the
+    # offline formulas. Per-sequence, so packing has no scatter path yet.
+    # TODO(jfacevedo): packed support (per-segment scatter), as for `overlong`.
+    bucket_edges = getattr(algo_config, "sampler_is_length_buckets", None)
+    if bucket_edges and segment_ids is None:
+      for key, value in sampler_is_length_bucket_sums(
+          log_is,
+          seq_log_mean,
+          completion_mask,
+          seq_valid,
+          bucket_edges,
+          overlong=overlong,
+      ).items():
+        aux[f"sampler_is/lenscale/{key}"] = value
 
   if sampler_is_weights is not None:
     sis = sampler_is_weights.astype(jnp.float32)

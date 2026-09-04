@@ -39,7 +39,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from tunix.perf.experimental import constants as perf_constants
-from tunix.rl import algo_core  # pylint: disable=unused-import
+from tunix.rl import algo_core
 from tunix.rl import common
 from tunix.rl import function_registry
 from tunix.rl import rl_cluster as rl_engine_lib
@@ -144,6 +144,22 @@ class GRPOConfig(agentic_rl_learner.AgenticRLConfig):
   # tokens, producing large-variance gradient updates.
   sampler_is: str | None = None  # None | "token"
   sampler_is_threshold: float = 2.0
+  # Keep-band for a sequence-level importance-sampling filter, reported (not
+  # applied) as ``sampler_is/is_oob_ratio``: the fraction of sequences whose
+  # geometric-mean sampler-vs-trainer weight falls outside
+  # [min, max]. Both must be set for the metric to appear. There is
+  # deliberately no default band -- supply the one your recipe specifies.
+  truncated_importance_sampling_ratio_min: float | None = None
+  truncated_importance_sampling_ratio: float | None = None
+  # Inclusive upper bounds, in completion tokens, of the length buckets used by
+  # the ``sampler_is/lenscale/*`` diagnostic; one open-ended bucket is appended.
+  # Bucketing the sequences already in a batch by their own length measures how
+  # the per-sequence sampler-vs-trainer offset scales with sequence length,
+  # which decides whether that offset is iid token noise (shrinks as 1/sqrt(T))
+  # or a systematic within-sequence bias (does not shrink). Choose edges that
+  # split your completion-length distribution into comparably populated bins.
+  # None disables the diagnostic.
+  sampler_is_length_buckets: tuple[int, ...] | None = None
 
   def __post_init__(self):
     if self.num_generations <= 1:
@@ -180,6 +196,36 @@ class GRPOConfig(agentic_rl_learner.AgenticRLConfig):
             self.off_policy_steps,
             self.off_policy_steps,
         )
+
+    lo = self.truncated_importance_sampling_ratio_min
+    hi = self.truncated_importance_sampling_ratio
+    if (lo is None) != (hi is None):
+      raise ValueError(
+          "truncated_importance_sampling_ratio_min and"
+          " truncated_importance_sampling_ratio must be set together (the"
+          f" keep-band needs both ends). Got min={lo}, max={hi}."
+      )
+    if lo is not None and hi is not None and lo > hi:
+      raise ValueError(
+          "truncated_importance_sampling_ratio_min must not exceed"
+          f" truncated_importance_sampling_ratio. Got min={lo}, max={hi}."
+      )
+
+    if self.sampler_is_length_buckets is not None:
+      edges = tuple(self.sampler_is_length_buckets)
+      if not edges:
+        raise ValueError(
+            "sampler_is_length_buckets must be non-empty when set; use None to"
+            " disable the length-scaling diagnostic."
+        )
+      if any(e <= 0 for e in edges) or any(
+          b <= a for a, b in zip(edges, edges[1:])
+      ):
+        raise ValueError(
+            "sampler_is_length_buckets must be strictly increasing positive"
+            f" token counts. Received: {edges}"
+        )
+      self.sampler_is_length_buckets = edges
 
 
 TGrpoConfig = TypeVar("TGrpoConfig", bound=GRPOConfig)
@@ -297,7 +343,21 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
             "algo_config": self.algo_config,
         }
     )
+    # Both blocks below are emitted by the loss only when their config knob is
+    # set, so register them conditionally to keep the two in step. The
+    # length-scaling diagnostic emits raw per-bucket sums so that pooling across
+    # micro-batches is exact; np.sum is the only correct aggregator for them.
+    # Derived ratios (rms, excess factor) are computed offline from these.
+    optional_metrics = {
+        f"sampler_is/lenscale/{suffix}": np.sum
+        for suffix in algo_core.sampler_is_length_bucket_metric_names(
+            self.algo_config.sampler_is_length_buckets
+        )
+    }
+    if self.algo_config.truncated_importance_sampling_ratio is not None:
+      optional_metrics["sampler_is/is_oob_ratio"] = common.mean_of_means
     self.rl_engine.actor_trainer.with_rl_metrics_to_log({  # pyrefly: ignore[bad-argument-type]
+        **optional_metrics,
         "kl": common.mean_of_means,
         "entropy": common.mean_of_means,
         "reduced_pg_loss": common.mean_of_means,

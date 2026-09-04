@@ -143,5 +143,152 @@ class AlgoCoreTest(absltest.TestCase):
         np.testing.assert_allclose(lp, -2.25, rtol=1e-4, atol=1e-4)
 
 
+class SamplerIsLengthScalingTest(absltest.TestCase):
+  """The sampler-vs-trainer offset length-scaling diagnostic.
+
+  The statistic has to separate two hypotheses that look identical in a batch
+  average but imply opposite things at production sequence length: iid token
+  noise (the per-sequence offset shrinks as 1/sqrt(T)) versus a systematic
+  within-sequence bias (it does not shrink at all).
+  """
+
+  _EDGES = (256, 512, 1024)
+  _LENGTHS = (128, 384, 768, 2048)  # one per bucket, incl. the open-ended one
+  _N_PER_LENGTH = 400
+  _TOKEN_SIGMA = 0.018  # per-token log-ratio scatter, as measured on qwen3-4b
+
+  def _synthesize(self, per_sequence_offset_sigma):
+    """A batch of mixed-length sequences under a known hypothesis.
+
+    Args:
+      per_sequence_offset_sigma: Scale of a constant offset added to every token
+        of a sequence. 0.0 gives pure iid token noise; a positive value adds the
+        systematic component that sqrt(T) averaging cannot remove.
+
+    Returns:
+      (log_is, completion_mask), right-padded to the longest length.
+    """
+    rng = np.random.default_rng(0)
+    t_max = max(self._LENGTHS)
+    log_is = np.zeros(
+        (len(self._LENGTHS) * self._N_PER_LENGTH, t_max), dtype=np.float32
+    )
+    mask = np.zeros_like(log_is)
+    for i, length in enumerate(self._LENGTHS):
+      rows = slice(i * self._N_PER_LENGTH, (i + 1) * self._N_PER_LENGTH)
+      tokens = rng.normal(
+          0.0, self._TOKEN_SIGMA, size=(self._N_PER_LENGTH, length)
+      )
+      if per_sequence_offset_sigma:
+        tokens += rng.normal(
+            0.0, per_sequence_offset_sigma, size=(self._N_PER_LENGTH, 1)
+        )
+      log_is[rows, :length] = tokens
+      mask[rows, :length] = 1.0
+    return jnp.asarray(log_is), jnp.asarray(mask)
+
+  def _bucket_sums(self, per_sequence_offset_sigma, overlong=None):
+    log_is, completion_mask = self._synthesize(per_sequence_offset_sigma)
+    seq_log_mean = (log_is * completion_mask).sum(axis=-1) / (
+        completion_mask.sum(axis=-1) + 1e-8
+    )
+    return algo_core.sampler_is_length_bucket_sums(
+        log_is,
+        seq_log_mean,
+        completion_mask,
+        jnp.ones_like(seq_log_mean),
+        self._EDGES,
+        overlong=overlong,
+    )
+
+  def _excess_per_bucket(self, per_sequence_offset_sigma, status='complete'):
+    """Runs the diagnostic and applies its documented offline formulas."""
+    sums = self._bucket_sums(per_sequence_offset_sigma)
+    excess = []
+    for name in algo_core.sampler_is_length_bucket_names(self._EDGES):
+      prefix = f'{name}/{status}'
+      count = float(sums[f'{prefix}/count'])
+      observed_rms = np.sqrt(float(sums[f'{prefix}/logmean_sq_sum']) / count)
+      iid_rms = np.sqrt(float(sums[f'{prefix}/iid_var_sum']) / count)
+      excess.append(observed_rms / iid_rms)
+    return excess
+
+  def test_bucket_names(self):
+    self.assertEqual(
+        algo_core.sampler_is_length_bucket_names((256, 1024)),
+        ['le256', 'le1024', 'gt1024'],
+    )
+    self.assertEqual(algo_core.sampler_is_length_bucket_names(None), [])
+    self.assertEqual(algo_core.sampler_is_length_bucket_names(()), [])
+
+  def test_buckets_partition_the_batch_by_length(self):
+    sums = self._bucket_sums(0.0)
+    names = algo_core.sampler_is_length_bucket_names(self._EDGES)
+    # Every sequence lands in exactly one bucket, and each bucket holds the
+    # length it was built from. With no truncation verdict supplied, all of
+    # them report as complete.
+    counts = [float(sums[f'{n}/complete/count']) for n in names]
+    self.assertEqual(counts, [float(self._N_PER_LENGTH)] * len(names))
+    self.assertEqual(
+        [float(sums[f'{n}/truncated/count']) for n in names], [0.0] * len(names)
+    )
+    for name, length in zip(names, self._LENGTHS):
+      mean_length = (
+          float(sums[f'{name}/complete/len_sum']) / self._N_PER_LENGTH
+      )
+      self.assertAlmostEqual(mean_length, length, places=3)
+
+  def test_completion_status_split_is_disjoint_and_additive(self):
+    # Half the sequences marked truncated: the two series must partition the
+    # bucket, so that summing them recovers the unsplit total.
+    n_rows = len(self._LENGTHS) * self._N_PER_LENGTH
+    overlong = jnp.asarray(np.tile([0.0, 1.0], n_rows // 2), dtype=jnp.float32)
+    sums = self._bucket_sums(0.0, overlong=overlong)
+    unsplit = self._bucket_sums(0.0)
+    for name in algo_core.sampler_is_length_bucket_names(self._EDGES):
+      complete = float(sums[f'{name}/complete/count'])
+      truncated = float(sums[f'{name}/truncated/count'])
+      self.assertEqual(complete, self._N_PER_LENGTH / 2)
+      self.assertEqual(truncated, self._N_PER_LENGTH / 2)
+      for metric in algo_core.SAMPLER_IS_LENGTH_BUCKET_METRICS:
+        np.testing.assert_allclose(
+            float(sums[f'{name}/complete/{metric}'])
+            + float(sums[f'{name}/truncated/{metric}']),
+            float(unsplit[f'{name}/complete/{metric}']),
+            rtol=1e-5,
+            err_msg=f'{name}/{metric} is not additive across the split',
+        )
+
+  def test_metric_names_cover_what_the_sums_emit(self):
+    # The learner registers aggregators from the name list, so it must match
+    # the keys the loss actually produces, exactly.
+    self.assertCountEqual(
+        algo_core.sampler_is_length_bucket_metric_names(self._EDGES),
+        list(self._bucket_sums(0.0).keys()),
+    )
+    self.assertEmpty(algo_core.sampler_is_length_bucket_metric_names(None))
+
+  def test_iid_noise_gives_flat_unit_excess(self):
+    # Pure iid tokens: the observed per-sequence spread is exactly what
+    # 1/sqrt(T) averaging predicts, at every length.
+    excess = self._excess_per_bucket(0.0)
+    for name, value in zip(
+        algo_core.sampler_is_length_bucket_names(self._EDGES), excess
+    ):
+      self.assertBetween(value, 0.9, 1.15, msg=f'bucket {name}')
+
+  def test_systematic_offset_gives_excess_growing_with_length(self):
+    # A per-sequence constant offset survives averaging, so the observed spread
+    # stays flat in T while the iid prediction keeps falling -- their ratio must
+    # therefore grow with bucket length. This is the signature to look for.
+    excess = self._excess_per_bucket(per_sequence_offset_sigma=0.005)
+    self.assertTrue(
+        all(a < b for a, b in zip(excess, excess[1:])),
+        msg=f'excess should increase with bucket length, got {excess}',
+    )
+    # 16x length range between the first and last bucket, so ~4x in sqrt(T).
+    self.assertGreater(excess[-1] / excess[0], 3.0)
+
+
 if __name__ == '__main__':
   absltest.main()
